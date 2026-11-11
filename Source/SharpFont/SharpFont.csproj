@@ -3,7 +3,7 @@
 		<AssemblyName>SpaceWizards.SharpFont</AssemblyName>
 		<TargetFramework>net9.0</TargetFramework>
 		<AllowUnsafeBlocks>true</AllowUnsafeBlocks>
-		<Version>1.1.0</Version>
+		<Version>1.1.0-everdeep.1</Version>
 
 		<GenerateDocumentationFile>true</GenerateDocumentationFile>
 		<IncludeSymbols>true</IncludeSymbols>

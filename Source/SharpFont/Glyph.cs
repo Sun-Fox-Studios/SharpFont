@@ -23,6 +23,7 @@ SOFTWARE.*/
 #endregion
 
 using System;
+using System.Threading;
 using SharpFont.Interop;
 
 namespace SharpFont
@@ -35,6 +36,7 @@ namespace SharpFont
 		#region Fields
 
 		private bool disposed;
+		private int disposeStarted;
 
 		internal FT_GlyphRec_* reference;
 
@@ -331,11 +333,7 @@ namespace SharpFont
 			Error err = Methods.FT_Glyph_Stroke(&sourceRef, stroker.reference, (byte)(destroy ? 1 : 0));
 
 			if (destroy && err == Error.Ok)
-			{
-				//if FT_Glyph_Stroke destroys the glyph, keep the C# side synchronized.
-				disposed = true;
-				reference = null;
-			}
+				MarkDestroyed();
 
 			if (err != Error.Ok)
 				throw new FreeTypeException(err);
@@ -369,11 +367,7 @@ namespace SharpFont
 			Error err = Methods.FT_Glyph_StrokeBorder(&sourceRef, stroker.reference, (byte)(inside ? 1 : 0), (byte)(destroy ? 1 : 0));
 
 			if (destroy && err == Error.Ok)
-			{
-				//if FT_Glyph_Stroke destroys the glyph, keep the C# side synchronized.
-				disposed = true;
-				reference = null;
-			}
+				MarkDestroyed();
 
 			if (err != Error.Ok)
 				throw new FreeTypeException(err);
@@ -395,19 +389,29 @@ namespace SharpFont
 			GC.SuppressFinalize(this);
 		}
 
+		// FreeType destroyed the native glyph (like FT_Glyph_Stroke does when asked to), so keep the C# side synchronized,
+		// including the parent Library, which would hold on to this forever otherwise.
+		private void MarkDestroyed()
+		{
+			Interlocked.Exchange(ref disposeStarted, 1);
+			disposed = true;
+			reference = null;
+			parentLibrary.RemoveChildGlyph(this);
+			GC.SuppressFinalize(this);
+		}
+
 		private void Dispose(bool disposing)
 		{
-			if (!disposed)
+			// Only the first call frees the native object, even when the Library or another thread disposes this at the
+			// same time
+			if (Interlocked.Exchange(ref disposeStarted, 1) == 0)
 			{
 				disposed = true;
 
 				Methods.FT_Done_Glyph(reference);
 
-				// removes itself from the parent Library, with a check to prevent this from happening when Library is
-				// being disposed (Library disposes all it's children with a foreach loop, this causes an
-				// InvalidOperationException for modifying a collection during enumeration)
-				if (!parentLibrary.IsDisposed)
-					parentLibrary.RemoveChildGlyph(this);
+				// removes itself from the parent Library, which is thread-safe and does nothing once the Library is disposed
+				parentLibrary.RemoveChildGlyph(this);
 
 				reference = null;
 			}

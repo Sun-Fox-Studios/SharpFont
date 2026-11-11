@@ -23,6 +23,7 @@ SOFTWARE.*/
 #endregion
 
 using System;
+using System.Threading;
 using System.Runtime.InteropServices;
 using SharpFont.Interop;
 
@@ -49,6 +50,7 @@ namespace SharpFont.Cache
 		private Library parentLibrary;
 
 		private bool disposed;
+		private int disposeStarted;
 
 		#endregion
 
@@ -238,18 +240,17 @@ namespace SharpFont.Cache
 
 		private void Dispose(bool disposing)
 		{
-			if (!disposed)
+			// Only the first call frees the native object, even when the Library or another thread disposes this at the
+			// same time
+			if (Interlocked.Exchange(ref disposeStarted, 1) == 0)
 			{
 				disposed = true;
 
 				Methods.FTC_Manager_Done(reference);
 				reference = null;
 
-				// removes itself from the parent Library, with a check to prevent this from happening when Library is
-				// being disposed (Library disposes all it's children with a foreach loop, this causes an
-				// InvalidOperationException for modifying a collection during enumeration)
-				if (!parentLibrary.IsDisposed)
-					parentLibrary.RemoveChildManager(this);
+				// removes itself from the parent Library, which is thread-safe and does nothing once the Library is disposed
+				parentLibrary.RemoveChildManager(this);
 			}
 		}
 

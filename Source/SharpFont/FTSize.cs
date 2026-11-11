@@ -23,6 +23,7 @@ SOFTWARE.*/
 #endregion
 
 using System;
+using System.Threading;
 using SharpFont.Interop;
 
 namespace SharpFont
@@ -36,6 +37,7 @@ namespace SharpFont
 
 		private bool userAlloc;
 		private bool disposed;
+		private int disposeStarted;
 		private bool duplicate;
 
 		private FT_SizeRec_* reference;
@@ -217,7 +219,9 @@ namespace SharpFont
 
 		private void Dispose(bool disposing)
 		{
-			if (!disposed)
+			// Only the first call frees the native object, even when the Library or another thread disposes this at the
+			// same time
+			if (Interlocked.Exchange(ref disposeStarted, 1) == 0)
 			{
 				disposed = true;
 
@@ -227,10 +231,8 @@ namespace SharpFont
 					Methods.FT_Done_Size(reference);
 				}
 
-				// removes itself from the parent Face, with a check to prevent this from happening when Face is
-				// being disposed (Face disposes all it's children with a foreach loop, this causes an
-				// InvalidOperationException for modifying a collection during enumeration)
-				if (parentFace != null && !parentFace.IsDisposed)
+				// removes itself from the parent Face, which is thread-safe and does nothing once the Face is disposed
+				if (parentFace != null)
 					parentFace.RemoveChildSize(this);
 
 				reference = null;
