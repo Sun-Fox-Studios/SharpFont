@@ -23,6 +23,7 @@ SOFTWARE.*/
 #endregion
 
 using System;
+using System.Threading;
 using SharpFont.Interop;
 
 namespace SharpFont
@@ -36,6 +37,7 @@ namespace SharpFont
 
 		internal FT_StrokerRec_* reference;
 		private bool disposed;
+		private int disposeStarted;
 
 		private Library parentLibrary;
 
@@ -367,17 +369,16 @@ namespace SharpFont
 
 		private void Dispose(bool disposing)
 		{
-			if (!disposed)
+			// Only the first call frees the native object, even when the Library or another thread disposes this at the
+			// same time
+			if (Interlocked.Exchange(ref disposeStarted, 1) == 0)
 			{
 				disposed = true;
 
 				Methods.FT_Stroker_Done(reference);
 
-				// removes itself from the parent Library, with a check to prevent this from happening when Library is
-				// being disposed (Library disposes all it's children with a foreach loop, this causes an
-				// InvalidOperationException for modifying a collection during enumeration)
-				if (!parentLibrary.IsDisposed)
-					parentLibrary.RemoveChildStroker(this);
+				// removes itself from the parent Library, which is thread-safe and does nothing once the Library is disposed
+				parentLibrary.RemoveChildStroker(this);
 			}
 		}
 

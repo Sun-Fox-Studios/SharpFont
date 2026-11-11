@@ -25,6 +25,7 @@ SOFTWARE.*/
 using System;
 using System.Collections.Generic;
 using System.Runtime.InteropServices;
+using System.Threading;
 using SharpFont.Cache;
 using SharpFont.Interop;
 using SharpFont.TrueType;
@@ -38,7 +39,10 @@ namespace SharpFont
 	/// It also embeds a memory manager (see <see cref="Memory"/>), as well as a scan-line converter object (see
 	/// <see cref="Raster"/>).
 	/// </para><para>
-	/// For multi-threading applications each thread should have its own <see cref="Library"/> object.
+	/// A <see cref="Library"/> can be shared between threads: the objects created from it (faces, glyphs, outlines,
+	/// strokers and cache managers) can be created and disposed on any thread, also while others are. Creating and
+	/// destroying faces is serialized, as FreeType requires. Using a single object, like loading glyphs into one
+	/// <see cref="Face"/>, is still not thread-safe, so do that on one thread at a time.
 	/// </para></summary>
 	public sealed unsafe class Library : IDisposable
 	{
@@ -47,13 +51,21 @@ namespace SharpFont
 		internal FT_LibraryRec_* reference;
 
 		private bool customMemory;
-		private bool disposed;
+		private volatile bool disposed;
 
-		private List<Face> childFaces;
-		private List<Glyph> childGlyphs;
-		private List<Outline> childOutlines;
-		private List<Stroker> childStrokers;
-		private List<Manager> childManagers;
+		// Guards the child collections and the switch to disposed, so children can be created and disposed on any
+		// thread. Only held for a collection change, never around a native call.
+		private readonly Lock childLock = new Lock();
+
+		// Serializes creating and destroying faces, which FreeType requires when a library is shared between threads.
+		internal readonly Lock faceLock = new Lock();
+
+		// Sets, so a child removes itself in constant time instead of a search through every live object.
+		private HashSet<Face> childFaces;
+		private HashSet<Glyph> childGlyphs;
+		private HashSet<Outline> childOutlines;
+		private HashSet<Stroker> childStrokers;
+		private HashSet<Manager> childManagers;
 
 		#endregion
 
@@ -102,11 +114,11 @@ namespace SharpFont
 
 		private Library(bool duplicate)
 		{
-			childFaces = new List<Face>();
-			childGlyphs = new List<Glyph>();
-			childOutlines = new List<Outline>();
-			childStrokers = new List<Stroker>();
-			childManagers = new List<Manager>();
+			childFaces = new HashSet<Face>();
+			childGlyphs = new HashSet<Glyph>();
+			childOutlines = new HashSet<Outline>();
+			childStrokers = new HashSet<Stroker>();
+			childManagers = new HashSet<Manager>();
 		}
 
 		/// <summary>
@@ -241,7 +253,9 @@ namespace SharpFont
 
 			FT_FaceRec_* faceRef;
 
-			Error err = Methods.FT_Open_Face(reference, args.reference, faceIndex, &faceRef);
+			Error err;
+			lock (faceLock)
+				err = Methods.FT_Open_Face(reference, args.reference, faceIndex, &faceRef);
 
 			if (err != Error.Ok)
 				throw new FreeTypeException(err);
@@ -278,7 +292,9 @@ namespace SharpFont
 
 			FT_FaceRec_* faceRef;
 
-			Error err = Methods.FT_New_Face_From_FOND(reference, (void*)fond, faceIndex, &faceRef);
+			Error err;
+			lock (faceLock)
+				err = Methods.FT_New_Face_From_FOND(reference, (void*)fond, faceIndex, &faceRef);
 
 			if (err != Error.Ok)
 				throw new FreeTypeException(err);
@@ -307,7 +323,9 @@ namespace SharpFont
 
 			FT_FaceRec_* faceRef;
 
-			Error err = Methods.FT_New_Face_From_FSSpec(reference, (IntPtr*)spec, faceIndex, &faceRef);
+			Error err;
+			lock (faceLock)
+				err = Methods.FT_New_Face_From_FSSpec(reference, (IntPtr*)spec, faceIndex, &faceRef);
 
 			if (err != Error.Ok)
 				throw new FreeTypeException(err);
@@ -336,7 +354,9 @@ namespace SharpFont
 
 			FT_FaceRec_* faceRef;
 
-			Error err = Methods.FT_New_Face_From_FSRef(reference, (void*)@ref, faceIndex, &faceRef);
+			Error err;
+			lock (faceLock)
+				err = Methods.FT_New_Face_From_FSRef(reference, (void*)@ref, faceIndex, &faceRef);
 
 			if (err != Error.Ok)
 				throw new FreeTypeException(err);
@@ -590,7 +610,7 @@ namespace SharpFont
 			FT_Prop_GlyphToScriptMap_ rec;
 			PropertyGet(moduleName, propertyName, out rec);
 
-			Face face = childFaces.Find(f => f.reference == rec.face);
+			Face face = FindChildFace(rec.face);
 			return new GlyphToScriptMapProperty(rec, face);
 		}
 
@@ -609,7 +629,7 @@ namespace SharpFont
 			FT_Prop_IncreaseXHeight_ rec;
 			PropertyGet(moduleName, propertyName, out rec);
 
-			Face face = childFaces.Find(f => f.reference == rec.face);
+			Face face = FindChildFace(rec.face);
 			return new IncreaseXHeightProperty(rec, face);
 		}
 
@@ -821,85 +841,144 @@ namespace SharpFont
 
 		internal void AddChildFace(Face child)
 		{
-			childFaces.Add(child);
+			AddChild(childFaces, child);
 		}
 
 		internal void RemoveChildFace(Face child)
 		{
-			childFaces.Remove(child);
+			RemoveChild(childFaces, child);
 		}
 
 		internal void AddChildGlyph(Glyph child)
 		{
-			childGlyphs.Add(child);
+			AddChild(childGlyphs, child);
 		}
 
 		internal void RemoveChildGlyph(Glyph child)
 		{
-			childGlyphs.Remove(child);
+			RemoveChild(childGlyphs, child);
 		}
 
 		internal void AddChildOutline(Outline child)
 		{
-			childOutlines.Add(child);
+			AddChild(childOutlines, child);
 		}
 
 		internal void RemoveChildOutline(Outline child)
 		{
-			childOutlines.Remove(child);
+			RemoveChild(childOutlines, child);
 		}
 
 		internal void AddChildStroker(Stroker child)
 		{
-			childStrokers.Add(child);
+			AddChild(childStrokers, child);
 		}
 
 		internal void RemoveChildStroker(Stroker child)
 		{
-			childStrokers.Remove(child);
+			RemoveChild(childStrokers, child);
 		}
 
 		internal void AddChildManager(Manager child)
 		{
-			childManagers.Add(child);
+			AddChild(childManagers, child);
 		}
 
 		internal void RemoveChildManager(Manager child)
 		{
-			childManagers.Remove(child);
+			RemoveChild(childManagers, child);
+		}
+
+		// Thread-safe. Throws if the library is disposed, as the child could then never be disposed with it.
+		private void AddChild<T>(HashSet<T> children, T child)
+		{
+			lock (childLock)
+			{
+				if (disposed)
+					throw new ObjectDisposedException("Library", "Cannot create an object from a disposed library.");
+
+				children.Add(child);
+			}
+		}
+
+		// Thread-safe. Does nothing once the library is disposed, as that already took all of its children.
+		private void RemoveChild<T>(HashSet<T> children, T child)
+		{
+			lock (childLock)
+			{
+				children.Remove(child);
+			}
+		}
+
+		// Removes and returns all children of a collection. The caller must hold childLock.
+		private static T[] TakeChildren<T>(HashSet<T> children)
+		{
+			T[] taken = new T[children.Count];
+			children.CopyTo(taken);
+			children.Clear();
+			return taken;
+		}
+
+		private Face FindChildFace(FT_FaceRec_* faceReference)
+		{
+			lock (childLock)
+			{
+				foreach (Face f in childFaces)
+				{
+					if (f.reference == faceReference)
+						return f;
+				}
+			}
+
+			return null;
 		}
 
 		private void Dispose(bool disposing)
 		{
-			if (!disposed)
+			Face[] faces;
+			Glyph[] glyphs;
+			Outline[] outlines;
+			Stroker[] strokers;
+			Manager[] managers;
+
+			// Take all children at once, so no child can be added or missed while the library is going away
+			lock (childLock)
 			{
+				if (disposed)
+					return;
+
 				disposed = true;
 
-				//dipose all the children before disposing the library.
-				foreach (Face f in childFaces)
-					f.Dispose();
-
-				foreach (Glyph g in childGlyphs)
-					g.Dispose();
-
-				foreach (Outline o in childOutlines)
-					o.Dispose();
-
-				foreach (Stroker s in childStrokers)
-					s.Dispose();
-
-				foreach (Manager m in childManagers)
-					m.Dispose();
-
-				childFaces.Clear();
-				childGlyphs.Clear();
-				childOutlines.Clear();
-				childStrokers.Clear();
-				childManagers.Clear();
-
-				Error err = customMemory ? Methods.FT_Done_Library(reference) : Methods.FT_Done_FreeType(reference);
-				reference = null;
+				faces = TakeChildren(childFaces);
+				glyphs = TakeChildren(childGlyphs);
+				outlines = TakeChildren(childOutlines);
+				strokers = TakeChildren(childStrokers);
+				managers = TakeChildren(childManagers);
 			}
+
+			// Dispose all the children before disposing the library. This is done outside of the lock, as a child that
+			// is disposed on another thread at the same time takes it to remove itself. Each child frees its native
+			// object only once, whichever thread gets to it first.
+			foreach (Face f in faces)
+				f.Dispose();
+
+			foreach (Glyph g in glyphs)
+				g.Dispose();
+
+			foreach (Outline o in outlines)
+				o.Dispose();
+
+			foreach (Stroker s in strokers)
+				s.Dispose();
+
+			foreach (Manager m in managers)
+				m.Dispose();
+
+			lock (faceLock)
+			{
+				Error err = customMemory ? Methods.FT_Done_Library(reference) : Methods.FT_Done_FreeType(reference);
+			}
+			reference = null;
 		}
 
 		#endregion

@@ -25,6 +25,7 @@ SOFTWARE.*/
 using System;
 using System.Collections.Generic;
 using System.Runtime.InteropServices;
+using System.Threading;
 using SharpFont.Bdf;
 using SharpFont.Interop;
 using SharpFont.MultipleMasters;
@@ -47,11 +48,15 @@ namespace SharpFont
 		internal FT_FaceRec_* reference;
 
 		private bool disposed;
+		private int disposeStarted;
 
 		private GCHandle memoryFaceHandle;
 
 		private Library parentLibrary;
 		private List<FTSize> childSizes;
+
+		// Guards childSizes, so sizes can be created and disposed on any thread
+		private readonly Lock childSizesLock = new Lock();
 
 		#endregion
 
@@ -83,7 +88,8 @@ namespace SharpFont
 			Error err;
 			fixed (FT_FaceRec_** pReference = &reference)
 			{
-				err = Methods.FT_New_Face(library.reference, fileName, faceIndex, pReference);
+				lock (library.faceLock)
+					err = Methods.FT_New_Face(library.reference, fileName, faceIndex, pReference);
 			}
 
 			Marshal.FreeCoTaskMem((IntPtr)fileName);
@@ -108,8 +114,11 @@ namespace SharpFont
 			Error err;
 			fixed (FT_FaceRec_** pReference = &reference)
 			{
-				err = Methods.FT_New_Memory_Face(library.reference, (byte*)memoryFaceHandle.AddrOfPinnedObject(),
-					file.Length, faceIndex, pReference);
+				lock (library.faceLock)
+				{
+					err = Methods.FT_New_Memory_Face(library.reference, (byte*)memoryFaceHandle.AddrOfPinnedObject(),
+						file.Length, faceIndex, pReference);
+				}
 			}
 
 			if (err != Error.Ok)
@@ -132,7 +141,8 @@ namespace SharpFont
 			Error err;
 			fixed (FT_FaceRec_** pReference = &reference)
 			{
-				err = Methods.FT_New_Memory_Face(library.reference, (byte*)bufferPtr, length, faceIndex, pReference);
+				lock (library.faceLock)
+					err = Methods.FT_New_Memory_Face(library.reference, (byte*)bufferPtr, length, faceIndex, pReference);
 			}
 
 			if (err != Error.Ok)
@@ -2427,32 +2437,50 @@ namespace SharpFont
 
 		internal void AddChildSize(FTSize child)
 		{
-			childSizes.Add(child);
+			lock (childSizesLock)
+				childSizes.Add(child);
 		}
 
 		internal void RemoveChildSize(FTSize child)
 		{
-			childSizes.Remove(child);
+			lock (childSizesLock)
+				childSizes.Remove(child);
 		}
 
 		private void Dispose(bool disposing)
 		{
-			if (!disposed)
+			// Only the first call frees the native object, even when the Library or another thread disposes this at the
+			// same time
+			if (Interlocked.Exchange(ref disposeStarted, 1) == 0)
 			{
 				disposed = true;
 
-				foreach (FTSize s in childSizes)
+				// take the sizes under the lock, but dispose them outside of it, as each removes itself
+				FTSize[] sizes;
+				lock (childSizesLock)
+				{
+					sizes = childSizes.ToArray();
+					childSizes.Clear();
+				}
+
+				foreach (FTSize s in sizes)
 					s.Dispose();
 
-				childSizes.Clear();
+				if (parentLibrary != null)
+				{
+					// FreeType requires destroying faces to be serialized with creating them
+					lock (parentLibrary.faceLock)
+						Methods.FT_Done_Face(reference);
 
-				Methods.FT_Done_Face(reference);
-
-				// removes itself from the parent Library, with a check to prevent this from happening when Library is
-				// being disposed (Library disposes all it's children with a foreach loop, this causes an
-				// InvalidOperationException for modifying a collection during enumeration)
-				if (!parentLibrary.IsDisposed)
+					// removes itself from the parent Library, which is thread-safe and does nothing once the Library
+					// is disposed
 					parentLibrary.RemoveChildFace(this);
+				}
+				else
+				{
+					// a marshalled duplicate, which only holds a reference to the face
+					Methods.FT_Done_Face(reference);
+				}
 
 				reference = null;
 
